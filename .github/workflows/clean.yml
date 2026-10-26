@@ -5,6 +5,11 @@ on:
     paths:
       - 'output.m3u'
       - '.github/workflows/clean.yml'
+  workflow_run:
+    workflows:
+      - "Update M3U Playlist"
+    types:
+      - completed
   workflow_dispatch:
 
 permissions:
