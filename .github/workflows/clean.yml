@@ -7,6 +7,9 @@ on:
       - '.github/workflows/clean.yml'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  
 jobs:
   clean:
     runs-on: ubuntu-latest
