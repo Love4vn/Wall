@@ -10,6 +10,21 @@ use tokio::time::timeout;
 const CONCURRENT_REQUESTS: usize = 100;
 const REQUEST_TIMEOUT: u64 = 5;
 
+// ==================== WHITELIST ====================
+/// Các URL khớp pattern này sẽ được coi là hợp lệ ngay,
+/// không cần kiểm tra qua mạng (do yêu cầu token động / geo-block).
+fn is_whitelisted_url(url: &str) -> bool {
+    let patterns = [
+        "HaNoiIPTV.short.gy",
+        "toiyeuvietnam.dpdns.org",
+        "live.fptplay53.net",
+        "vtvgolive-vtv.vtvdigital.vn",
+        "sgchill.duckdns.org",
+        "pk79.io.vn",
+    ];
+    patterns.iter().any(|p| url.contains(p))
+}
+
 #[derive(Debug, Clone)]
 struct PlaylistEntry {
     content: String,
@@ -88,18 +103,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("📥 Loaded {} ({} bytes)", input_file, content.len());
 
     let entries = parse_playlist_content(&content);
-    let original_count = entries.iter().filter(|e| e.entry_type == EntryType::StreamUrl).count();
-    println!("📊 Total lines: {}, Stream URLs: {}", entries.len(), original_count);
+    let original_count = entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::StreamUrl)
+        .count();
+    println!(
+        "📊 Total lines: {}, Stream URLs: {}",
+        entries.len(),
+        original_count
+    );
 
     let (filtered_entries, filtered_count) = filter_unwanted_entries(entries);
     if filtered_count > 0 {
-        println!("🚫 Filtered {} streams (adult/MP4/cinehub)", filtered_count);
+        println!(
+            "🚫 Filtered {} streams (adult/MP4/cinehub)",
+            filtered_count
+        );
     }
 
-    let streams_to_validate: Vec<(usize, String, Option<String>, Option<String>, Vec<(String, String)>)> = filtered_entries
+    let streams_to_validate: Vec<(
+        usize,
+        String,
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+    )> = filtered_entries
         .iter()
         .filter(|e| e.entry_type == EntryType::StreamUrl)
-        .map(|e| (e.original_index, e.content.clone(), e.vlc_user_agent.clone(), e.vlc_cookie.clone(), e.vlc_headers.clone()))
+        .map(|e| {
+            (
+                e.original_index,
+                e.content.clone(),
+                e.vlc_user_agent.clone(),
+                e.vlc_cookie.clone(),
+                e.vlc_headers.clone(),
+            )
+        })
         .collect();
     let total_to_check = streams_to_validate.len();
     println!("🔬 Validating {} streams...", total_to_check);
@@ -145,18 +184,6 @@ fn create_http_client() -> Client {
         .expect("Failed to create HTTP client")
 }
 
-fn is_whitelisted_url(url: &str) -> bool {
-    let patterns = [
-        "HaNoiIPTV.short.gy",
-        "toiyeuvietnam.dpdns.org",
-        "live.fptplay53.net",
-        "vtvgolive-vtv.vtvdigital.vn",
-        "sgchill.duckdns.org",
-        "pk79.io.vn",
-    ];
-    patterns.iter().any(|p| url.contains(p))
-}
-
 fn parse_playlist_content(content: &str) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
     let mut index = 0;
@@ -181,7 +208,7 @@ fn parse_playlist_content(content: &str) -> Vec<PlaylistEntry> {
                         let header_part = &rest["http-header=".len()..];
                         if let Some(colon_pos) = header_part.find(':') {
                             let key = header_part[..colon_pos].trim().to_string();
-                            let value = header_part[colon_pos+1..].trim().to_string();
+                            let value = header_part[colon_pos + 1..].trim().to_string();
                             pending_headers.push((key, value));
                         }
                     }
@@ -235,19 +262,21 @@ fn filter_unwanted_entries(entries: Vec<PlaylistEntry>) -> (Vec<PlaylistEntry>, 
         let entry = &entries[i];
         let should_filter = match entry.entry_type {
             EntryType::Metadata => {
-                entry.content.to_uppercase().contains("ADULT") ||
-                entry.content.contains("group-title=\"ADULT")
+                entry.content.to_uppercase().contains("ADULT")
+                    || entry.content.contains("group-title=\"ADULT")
             }
             EntryType::StreamUrl => {
-                entry.content.contains("cinehub24.com") ||
-                entry.content.to_lowercase().ends_with(".mp4") ||
-                entry.content.contains(".mp4?")
+                entry.content.contains("cinehub24.com")
+                    || entry.content.to_lowercase().ends_with(".mp4")
+                    || entry.content.contains(".mp4?")
             }
             _ => false,
         };
 
         if should_filter {
-            if entry.entry_type == EntryType::Metadata { skip_next_url = true; }
+            if entry.entry_type == EntryType::Metadata {
+                skip_next_url = true;
+            }
             filtered_count += 1;
             i += 1;
         } else if skip_next_url && entry.entry_type == EntryType::StreamUrl {
@@ -265,7 +294,13 @@ fn filter_unwanted_entries(entries: Vec<PlaylistEntry>) -> (Vec<PlaylistEntry>, 
 
 async fn validate_streams_batch(
     client: &Client,
-    streams: &[(usize, String, Option<String>, Option<String>, Vec<(String, String)>)],
+    streams: &[(
+        usize,
+        String,
+        Option<String>,
+        Option<String>,
+        Vec<(String, String)>,
+    )],
 ) -> Vec<(usize, bool, Option<Duration>, Option<String>)> {
     let total = streams.len();
     let results = stream::iter(streams.iter().enumerate())
@@ -278,16 +313,26 @@ async fn validate_streams_batch(
             let orig_idx = *orig_idx;
             async move {
                 let start = std::time::Instant::now();
+                // Whitelist hoặc udp:// => coi như hợp lệ ngay
                 let result = if url.starts_with("udp://") || is_whitelisted_url(&url) {
-                    ValidationResult { is_valid: true, error: None }
+                    ValidationResult {
+                        is_valid: true,
+                        error: None,
+                    }
                 } else {
                     validate_with_options(&client, &url, ua, cookie, &headers).await
                 };
                 let elapsed = start.elapsed();
-                let progress = format!("[{}/{}]", idx+1, total);
-                let short = extract_channel_name_from_url(&url).unwrap_or_else(|| shorten_url(&url));
+                let progress = format!("[{}/{}]", idx + 1, total);
+                let short =
+                    extract_channel_name_from_url(&url).unwrap_or_else(|| shorten_url(&url));
                 if result.is_valid {
-                    println!("   ✅ {} {} - ({}ms)", progress, short, elapsed.as_millis());
+                    println!(
+                        "   ✅ {} {} - ({}ms)",
+                        progress,
+                        short,
+                        elapsed.as_millis()
+                    );
                 } else {
                     let err = result.error.as_deref().unwrap_or("Unknown");
                     println!("   ❌ {} {} - {}", progress, short, err);
@@ -310,8 +355,14 @@ async fn validate_with_options(
 ) -> ValidationResult {
     let build_request = |builder: reqwest::RequestBuilder| {
         let mut builder = builder
-            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9,vi;q=0.8")
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            )
+            .header(
+                reqwest::header::ACCEPT_LANGUAGE,
+                "en-US,en;q=0.9,vi;q=0.8",
+            )
             .header("Accept-Encoding", "gzip, deflate, br")
             .header("Connection", "keep-alive")
             .header("Cache-Control", "no-cache")
@@ -324,7 +375,10 @@ async fn validate_with_options(
         if let Some(ua) = &user_agent {
             builder = builder.header(reqwest::header::USER_AGENT, ua);
         } else {
-            builder = builder.header(reqwest::header::USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            builder = builder.header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            );
         }
         if let Some(c) = &cookie {
             builder = builder.header(reqwest::header::COOKIE, c);
@@ -340,50 +394,97 @@ async fn validate_with_options(
     };
 
     // HEAD
-    let head_result = timeout(Duration::from_secs(REQUEST_TIMEOUT), build_request(client.head(url)).send()).await;
+    let head_result = timeout(
+        Duration::from_secs(REQUEST_TIMEOUT),
+        build_request(client.head(url)).send(),
+    )
+    .await;
     match head_result {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            let body_text = timeout(Duration::from_secs(3), resp.text()).await.ok().unwrap_or(Ok(String::new())).unwrap_or_default();
+            let body_text = timeout(Duration::from_secs(3), resp.text())
+                .await
+                .ok()
+                .unwrap_or(Ok(String::new()))
+                .unwrap_or_default();
             if let Some(err_msg) = extract_error_from_body(&body_text) {
-                return ValidationResult { is_valid: false, error: Some(err_msg) };
+                return ValidationResult {
+                    is_valid: false,
+                    error: Some(err_msg),
+                };
             }
             if status.is_success() {
-                return ValidationResult { is_valid: true, error: None };
+                return ValidationResult {
+                    is_valid: true,
+                    error: None,
+                };
             }
         }
         _ => {}
     }
 
     // GET with Range
-    let get_result = timeout(Duration::from_secs(REQUEST_TIMEOUT), build_request(client.get(url).header("Range", "bytes=0-1024")).send()).await;
+    let get_result = timeout(
+        Duration::from_secs(REQUEST_TIMEOUT),
+        build_request(client.get(url).header("Range", "bytes=0-1024")).send(),
+    )
+    .await;
     match get_result {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            let body_text = timeout(Duration::from_secs(3), resp.text()).await.ok().unwrap_or(Ok(String::new())).unwrap_or_default();
+            let body_text = timeout(Duration::from_secs(3), resp.text())
+                .await
+                .ok()
+                .unwrap_or(Ok(String::new()))
+                .unwrap_or_default();
             if let Some(err_msg) = extract_error_from_body(&body_text) {
-                return ValidationResult { is_valid: false, error: Some(err_msg) };
+                return ValidationResult {
+                    is_valid: false,
+                    error: Some(err_msg),
+                };
             }
             if status.is_success() || status.as_u16() == 206 {
                 if url.contains(".m3u8") {
                     if body_text.contains("#EXTM3U") || body_text.contains("#EXTINF") {
-                        return ValidationResult { is_valid: true, error: None };
+                        return ValidationResult {
+                            is_valid: true,
+                            error: None,
+                        };
                     } else {
-                        return ValidationResult { is_valid: false, error: Some("Invalid HLS playlist".to_string()) };
+                        return ValidationResult {
+                            is_valid: false,
+                            error: Some("Invalid HLS playlist".to_string()),
+                        };
                     }
                 }
-                return ValidationResult { is_valid: true, error: None };
+                return ValidationResult {
+                    is_valid: true,
+                    error: None,
+                };
             } else {
                 let err = if !body_text.is_empty() {
                     extract_error_from_body(&body_text).unwrap_or_else(|| format!("HTTP {}", status))
                 } else {
                     format!("HTTP {}", status)
                 };
-                return ValidationResult { is_valid: false, error: Some(err) };
+                return ValidationResult {
+                    is_valid: false,
+                    error: Some(err),
+                };
             }
         }
-        Ok(Err(e)) => ValidationResult { is_valid: false, error: Some(format!("Request error: {}", e)) },
-        Err(_) => ValidationResult { is_valid: false, error: Some("Timeout".to_string()) },
+        Ok(Err(e)) => {
+            return ValidationResult {
+                is_valid: false,
+                error: Some(format!("Request error: {}", e)),
+            }
+        }
+        Err(_) => {
+            return ValidationResult {
+                is_valid: false,
+                error: Some("Timeout".to_string()),
+            }
+        }
     }
 }
 
@@ -399,11 +500,16 @@ fn extract_error_from_body(body: &str) -> Option<String> {
         || lower.contains("this page isn’t working")
         || lower.contains("http error")
     {
-        let snippet = body.lines()
+        let snippet = body
+            .lines()
             .find(|l| {
                 let lc = l.to_lowercase();
-                lc.contains("access") || lc.contains("denied") || lc.contains("unauthorized")
-                || lc.contains("incorrect key") || lc.contains("401") || lc.contains("this page")
+                lc.contains("access")
+                    || lc.contains("denied")
+                    || lc.contains("unauthorized")
+                    || lc.contains("incorrect key")
+                    || lc.contains("401")
+                    || lc.contains("this page")
             })
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "Access denied/Invalid key".to_string());
@@ -417,8 +523,8 @@ fn extract_domain(url: &str) -> Option<String> {
     if let Some(start) = url.find("://") {
         let start = start + 3;
         let end = url[start..].find('/').unwrap_or(url.len() - start);
-        let domain = &url[start..start+end];
-        if let Some(scheme) = url.get(..start-3) {
+        let domain = &url[start..start + end];
+        if let Some(scheme) = url.get(..start - 3) {
             Some(format!("{}://{}", scheme, domain))
         } else {
             Some(format!("https://{}", domain))
@@ -463,15 +569,20 @@ fn write_cleaned_playlist(
     writeln!(writer, "#EXTM3U")?;
     writeln!(writer, "#PLAYLIST:{} - Cleaned", playlist.name)?;
     writeln!(writer, "#GENERATED-BY: CXT Cleaner v2.0 (Stalker Ready)")?;
-    writeln!(writer, "#VALIDATION-DATE: {}", date_str)?;
+    writeln!(writer, "#VALIDATION-DATE: {} (UTC+7)", date_str)?;
     writeln!(writer, "#TOTAL-STREAMS-CHECKED: {}", total_checked)?;
     writeln!(writer, "#TOTAL-VALID-STREAMS: {}", valid_count)?;
     if total_checked > 0 {
-        writeln!(writer, "#SUCCESS-RATE: {:.1}%", (valid_count as f32 / total_checked as f32) * 100.0)?;
+        writeln!(
+            writer,
+            "#SUCCESS-RATE: {:.1}%",
+            (valid_count as f32 / total_checked as f32) * 100.0
+        )?;
     } else {
         writeln!(writer, "#SUCCESS-RATE: N/A")?;
     }
     writeln!(writer, "#FILTERS-APPLIED: ADULT, .mp4, cinehub24.com")?;
+    writeln!(writer, "#WHITELIST: HaNoiIPTV.short.gy, toiyeuvietnam.dpdns.org, live.fptplay53.net, vtvgolive-vtv.vtvdigital.vn, sgchill.duckdns.org, pk79.io.vn")?;
     writeln!(writer, "#ORDER-PRESERVATION: Original order maintained")?;
     writeln!(writer, "########################################")?;
 
@@ -524,11 +635,14 @@ fn print_summary(playlist: &Playlist, valid_count: usize, total_checked: usize) 
     println!("   Checked: {}", total_checked);
     println!("   Valid: {}", valid_count);
     if total_checked > 0 {
-        println!("   Success Rate: {:.1}%", (valid_count as f32 / total_checked as f32) * 100.0);
+        println!(
+            "   Success Rate: {:.1}%",
+            (valid_count as f32 / total_checked as f32) * 100.0
+        );
     }
     println!("   Order Preservation: ✅");
     println!("   Stalker Portal Support: ✅ (User-Agent, Cookie, Headers)");
-    println!("   Whitelist (skip validation): HaNoiIPTV.short.gy, toiyeuvietnam.dpdns.org, live.fptplay53.net, vtvgolive-vtv.vtvdigital.vn, sgchill.duckdns.org, pk79.io.vn");
+    println!("   Whitelist: ✅ (6 domains)");
     println!("---------------------------------------------");
     println!("🚫 Active Filters:");
     println!("   • Adult content (group-title=\"ADULT LIVE\")");
@@ -540,8 +654,10 @@ fn print_summary(playlist: &Playlist, valid_count: usize, total_checked: usize) 
 fn extract_channel_name_from_url(url: &str) -> Option<String> {
     url.find("://").and_then(|start| {
         let domain_start = start + 3;
-        let domain_end = url[domain_start..].find('/').unwrap_or(url.len() - domain_start);
-        Some(url[domain_start..domain_start+domain_end].to_string())
+        let domain_end = url[domain_start..]
+            .find('/')
+            .unwrap_or(url.len() - domain_start);
+        Some(url[domain_start..domain_start + domain_end].to_string())
     })
 }
 
